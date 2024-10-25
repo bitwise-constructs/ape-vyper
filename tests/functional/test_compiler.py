@@ -1,27 +1,30 @@
 import re
 from pathlib import Path
+from typing import Optional
 
 import ape
 import pytest
 import vvm  # type: ignore
 from ape.exceptions import CompilerError, ContractLogicError
+from ape.types import SourceTraceback
 from ape.utils import get_full_extension
 from ethpm_types import ContractType
 from packaging.version import Version
 from vvm.exceptions import VyperError  # type: ignore
 
-from ape_vyper.compiler import RuntimeErrorType
+from ape_vyper._utils import EVM_VERSION_DEFAULT
 from ape_vyper.exceptions import (
     FallbackNotDefinedError,
     IntegerOverflowError,
     InvalidCalldataOrValueError,
     NonPayableError,
+    RuntimeErrorType,
     VyperCompileError,
     VyperInstallError,
 )
 
 # Currently, this is the only version specified from a pragma spec
-from .conftest import FAILING_BASE, FAILING_CONTRACT_NAMES, PASSING_CONTRACT_NAMES, TEMPLATES
+from ..conftest import FAILING_BASE, FAILING_CONTRACT_NAMES, PASSING_CONTRACT_NAMES, TEMPLATES
 
 OLDER_VERSION_FROM_PRAGMA = Version("0.2.16")
 VERSION_37 = Version("0.3.7")
@@ -130,6 +133,15 @@ def _transfer_ownership(new_owner: address):
     log OwnershipTransferred(old_owner, new_owner)
 
 
+# Showing importing interface from module.
+interface Ballot:
+    def delegated(addr: address) -> bool: view
+
+@internal
+def moduleMethod2() -> bool:
+    return True
+
+
 # This source is also imported from `zero_four.py` to test
 # multiple imports across sources during flattening.
 
@@ -141,15 +153,6 @@ def moduleMethod() -> bool:
 @external
 def callModule2FunctionFromAnotherSource(role: bytes32) -> bool:
     return self.moduleMethod2()
-
-
-# Showing importing interface from module.
-interface Ballot:
-    def delegated(addr: address) -> bool: view
-
-@internal
-def moduleMethod2() -> bool:
-    return True
 
 
 implements: IFaceZeroFour
@@ -303,6 +306,7 @@ def test_get_version_map(project, compiler, all_versions):
         "zero_four.vy",
         "zero_four_module.vy",
         "zero_four_module_2.vy",
+        "zero_four_snekmate_erc20.vy",
     }
     assert actual4 == expected4
 
@@ -375,11 +379,19 @@ def test_compile_parse_dev_messages(compiler, dev_revert_source, project):
 
 
 def test_get_imports(compiler, project):
+    # Ensure the dependency starts off un-compiled so we can show this
+    # is the point at which it will be compiled. We make sure to only
+    # compile when we know it is a JSON interface based dependency
+    # and not a site-package or relative-path based dependency.
+    dependency = project.dependencies["exampledependency"]["local"]
+    dependency.manifest.contract_types = {}
+
     vyper_files = [
         x for x in project.contracts_folder.iterdir() if x.is_file() and x.suffix == ".vy"
     ]
     actual = compiler.get_imports(vyper_files, project=project)
-    prefix = "contracts/passing_contracts"
+
+    prefix = "tests/contracts/passing_contracts"
     builtin_import = "vyper/interfaces/ERC20.json"
     local_import = "IFace.vy"
     local_from_import = "IFace2.vy"
@@ -397,7 +409,7 @@ def test_get_imports(compiler, project):
 
     actual_iface_use = actual[use_iface_key]
     for expected in (local_import, local_from_import, dependency_import, local_nested_import):
-        assert any(k for k in actual_iface_use if expected in k)
+        assert any(k for k in actual_iface_use if expected in k), f"{expected} not found"
 
     assert actual[use_iface2_key][0].endswith(local_import)
 
@@ -563,18 +575,40 @@ def test_enrich_error_handle_when_name(compiler, geth_provider, mocker):
     which we are still able to enrich.
     """
 
-    tb = mocker.MagicMock()
-    tb.revert_type = "NONPAYABLE_CHECK"
-    error = ContractLogicError("", source_traceback=tb)
+    class TB(SourceTraceback):
+        @property
+        def revert_type(self) -> Optional[str]:
+            return "NONPAYABLE_CHECK"
+
+    tb = TB([{"statements": [], "closure": {"name": "fn"}, "depth": 0}])  # type: ignore
+    error = ContractLogicError(None, source_traceback=tb)
     new_error = compiler.enrich_error(error)
     assert isinstance(new_error, NonPayableError)
 
 
+def test_trace_source(geth_provider, project, traceback_contract, account, compiler):
+    receipt = traceback_contract.addBalance(123, sender=account)
+    contract = project._create_contract_source(traceback_contract.contract_type)
+    trace = receipt.trace
+    actual = compiler.trace_source(contract, trace, receipt.data)
+    base_folder = Path(__file__).parent.parent / "contracts" / "passing_contracts"
+    contract_name = traceback_contract.contract_type.name
+    expected = rf"""
+Traceback (most recent call last)
+  File {base_folder}/{contract_name}.vy, in addBalance
+       32         if i != num:
+       33             continue
+       34
+  -->  35     return self._balance
+    """.strip()
+    assert str(actual) == expected
+
+
 @pytest.mark.parametrize("arguments", [(), (123,), (123, 321)])
-def test_trace_source(account, geth_provider, project, traceback_contract, arguments):
+def test_trace_source_from_receipt(account, geth_provider, project, traceback_contract, arguments):
     receipt = traceback_contract.addBalance(*arguments, sender=account)
     actual = receipt.source_traceback
-    base_folder = Path(__file__).parent / "contracts" / "passing_contracts"
+    base_folder = Path(__file__).parent.parent / "contracts" / "passing_contracts"
     contract_name = traceback_contract.contract_type.name
     expected = rf"""
 Traceback (most recent call last)
@@ -613,7 +647,7 @@ def test_trace_source_content_from_kwarg_default_parametrization(
     check("addBalance(uint256,uint256)", both_args_tb)
 
 
-def test_trace_err_source(account, geth_provider, project, traceback_contract):
+def test_trace_source_when_err(account, geth_provider, project, traceback_contract):
     txn = traceback_contract.addBalance_f.as_transaction(123)
     try:
         account.call(txn)
@@ -622,7 +656,7 @@ def test_trace_err_source(account, geth_provider, project, traceback_contract):
 
     receipt = geth_provider.get_receipt(txn.txn_hash.hex())
     actual = receipt.source_traceback
-    base_folder = Path(__file__).parent / "contracts" / "passing_contracts"
+    base_folder = Path(__file__).parent.parent / "contracts" / "passing_contracts"
     contract_name = traceback_contract.contract_type.name
     version_key = contract_name.split("traceback_contract_")[-1]
     expected = rf"""
@@ -662,7 +696,7 @@ def test_trace_source_default_method(geth_provider, account, project):
 def test_compile_with_version_set_in_config(config, projects_path, compiler, mocker):
     path = projects_path / "version_in_config"
     version_from_config = "0.3.7"
-    spy = mocker.patch("ape_vyper.compiler.vvm_compile_standard")
+    spy = mocker.patch("ape_vyper.compiler._versions.base.vvm_compile_standard")
     project = ape.Project(path)
 
     contract = project.contracts_folder / "v_contract.vy"
@@ -682,6 +716,10 @@ def test_compile_code(project, compiler, dev_revert_source):
     assert len(actual.abi) > 1
     assert len(actual.deployment_bytecode.bytecode) > 1
     assert len(actual.runtime_bytecode.bytecode) > 1
+
+    # Ensure temp-file was deleted.
+    file = project.path / "MyContract.vy"
+    assert not file.is_file()
 
 
 def test_compile_with_version_set_in_settings_dict(config, compiler_manager, projects_path):
@@ -734,3 +772,64 @@ def test_flatten_contract_04(project, compiler):
     version = compiler._source_vyper_version(source_code)
     vvm.install_vyper(str(version))
     vvm.compile_source(source_code, base_path=project.path, vyper_version=version)
+
+
+def test_get_import_remapping(project, compiler):
+    dependency = project.dependencies["exampledependency"]["local"]
+    dependency.manifest.contract_types = {}
+
+    # Getting import remapping does not compile on its own!
+    # This is important because we don't necessarily want to
+    # compile every dependency, only the ones with imports
+    # that indicate this.
+    actual = compiler.get_import_remapping(project=project)
+    assert actual == {}
+
+    dependency.load_contracts()
+    actual = compiler.get_import_remapping(project=project)
+    assert "exampledependency/Dependency.json" in actual
+
+
+def test_get_compiler_settings(project, compiler):
+    vyper2_path = project.contracts_folder / "older_version.vy"
+    vyper3_path = project.contracts_folder / "non_payable_default.vy"
+    vyper4_path = project.contracts_folder / "zero_four.vy"
+    vyper2_settings = compiler.get_compiler_settings((vyper2_path,), project=project)
+    vyper3_settings = compiler.get_compiler_settings((vyper3_path,), project=project)
+    vyper4_settings = compiler.get_compiler_settings((vyper4_path,), project=project)
+
+    v2_version_used = next(iter(vyper2_settings.keys()))
+    assert v2_version_used >= Version("0.2.16"), f"version={v2_version_used}"
+    assert vyper2_settings[v2_version_used]["true%berlin"]["optimize"] is True
+    assert vyper2_settings[v2_version_used]["true%berlin"]["evmVersion"] == "berlin"
+    assert vyper2_settings[v2_version_used]["true%berlin"]["outputSelection"] == {
+        "tests/contracts/passing_contracts/older_version.vy": ["*"]
+    }
+    assert "enable_decimals" not in vyper2_settings[v2_version_used]["true%berlin"]
+
+    v3_version_used = next(iter(vyper3_settings.keys()))
+    settings_key = next(iter(vyper3_settings[v3_version_used].keys()))
+    valid_evm_versions = [
+        v for k, v in EVM_VERSION_DEFAULT.items() if Version(k) >= Version("0.3.0")
+    ]
+    pattern = rf"true%({'|'.join(valid_evm_versions)})"
+    assert re.match(pattern, settings_key)
+    assert v3_version_used >= Version("0.3.0"), f"version={v3_version_used}"
+    assert vyper3_settings[v3_version_used][settings_key]["optimize"] is True
+    assert vyper3_settings[v3_version_used][settings_key]["evmVersion"] in valid_evm_versions
+    assert vyper3_settings[v3_version_used][settings_key]["outputSelection"] == {
+        "tests/contracts/passing_contracts/non_payable_default.vy": ["*"]
+    }
+    assert "enable_decimals" not in vyper3_settings[v3_version_used][settings_key]
+
+    assert len(vyper4_settings) == 1, f"extra keys={''.join([f'{x}' for x in vyper4_settings])}"
+    v4_version_used = next(iter(vyper4_settings.keys()))
+    assert v4_version_used >= Version(
+        "0.4.0"
+    ), f"version={v4_version_used} full_data={vyper4_settings}"
+    assert vyper4_settings[v4_version_used]["gas%shanghai"]["enable_decimals"] is True
+    assert vyper4_settings[v4_version_used]["gas%shanghai"]["optimize"] == "gas"
+    assert vyper4_settings[v4_version_used]["gas%shanghai"]["outputSelection"] == {
+        "tests/contracts/passing_contracts/zero_four.vy": ["*"]
+    }
+    assert vyper4_settings[v4_version_used]["gas%shanghai"]["evmVersion"] == "shanghai"
